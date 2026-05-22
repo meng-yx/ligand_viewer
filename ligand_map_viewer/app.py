@@ -10,7 +10,6 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 from rdkit import Chem
-from rdkit.Chem import Draw
 from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
 from st_aggrid.shared import GridUpdateMode
 
@@ -32,6 +31,13 @@ STRUCTURE_COL_WIDTH = 440
 def _smiles_to_base64(smiles: str | None, size: tuple[int, int] = STRUCTURE_IMG_SIZE) -> str | None:
     if not smiles or not isinstance(smiles, str) or not smiles.strip():
         return None
+    try:
+        from rdkit.Chem import Draw
+    except ImportError as exc:
+        raise ImportError(
+            "RDKit Draw failed to load (Cairo/X11 libraries missing). "
+            "On Streamlit Cloud, use environment.yml + packages.txt from the repo README."
+        ) from exc
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return None

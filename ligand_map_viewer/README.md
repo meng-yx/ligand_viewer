@@ -26,9 +26,10 @@ SSH tunnel: `ssh -L 8501:localhost:8501 <host>` → open http://localhost:8501
 1. Push this repository to **GitHub** (public repo, or your one free private app).
 2. Ensure these files are committed:
    - `specific_ligands.csv` (repo root)
+   - `packages.txt` (repo root — RDKit system libraries)
    - `ligand_map_viewer/app.py`
    - `ligand_map_viewer/pdb_mapping.py`
-   - `ligand_map_viewer/requirements.txt`
+   - `ligand_map_viewer/environment.yml`
 
 ### Steps
 
@@ -41,7 +42,9 @@ SSH tunnel: `ssh -L 8501:localhost:8501 <host>` → open http://localhost:8501
    - **Python version**: 3.11 (or 3.10 if RDKit build fails on 3.11)
 7. Click **Deploy**.
 
-Cloud will install dependencies from `ligand_map_viewer/requirements.txt` (next to the entrypoint). Pushes to the deployed branch redeploy automatically.
+Cloud installs dependencies from **`ligand_map_viewer/environment.yml`** (conda-forge RDKit with Cairo) plus **`packages.txt`** at the repo root (X11/Cairo system libs). Local MaSIF installs can still use `requirements.txt` via pip.
+
+Pushes to the deployed branch redeploy automatically.
 
 ### Notes
 
@@ -55,7 +58,8 @@ Cloud will install dependencies from `ligand_map_viewer/requirements.txt` (next 
 
 | Issue | Fix |
 |-------|-----|
-| `ModuleNotFoundError: rdkit` | Retry deploy; or set Python 3.10 in Advanced settings |
+| `ImportError` on `rdkit.Chem.Draw` / `rdMolDraw2D` | Commit root `packages.txt` + `ligand_map_viewer/environment.yml`; reboot app |
+| `ModuleNotFoundError: rdkit` | Retry deploy; ensure `environment.yml` is used (not pip-only `requirements.txt`) |
 | CSV not found | Commit `specific_ligands.csv` at repo root |
 | Build timeout | Pin lighter versions in `requirements.txt` |
 | 3D view empty | Check Streamlit logs; RCSB may be rate-limiting |

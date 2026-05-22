@@ -1,4 +1,5 @@
-# Streamlit Community Cloud dependencies (ligand_map_viewer/app.py)
+# Local pip install (MaSIF): pip install -r ligand_map_viewer/requirements.txt
+# Streamlit Community Cloud uses environment.yml + repo-root packages.txt instead.
 streamlit>=1.28,<2
 streamlit-aggrid>=1.0
 pandas>=2.0
