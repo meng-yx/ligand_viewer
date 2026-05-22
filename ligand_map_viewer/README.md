@@ -26,7 +26,7 @@ SSH tunnel: `ssh -L 8501:localhost:8501 <host>` → open http://localhost:8501
 1. Push this repository to **GitHub** (public repo, or your one free private app).
 2. Ensure these files are committed:
    - `specific_ligands.csv` (repo root)
-   - `packages.txt` (repo root — RDKit system libraries)
+   - `packages.txt` (repo root — one apt package name per line, no comments)
    - `ligand_map_viewer/app.py`
    - `ligand_map_viewer/pdb_mapping.py`
    - `ligand_map_viewer/environment.yml`
