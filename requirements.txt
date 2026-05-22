@@ -1,0 +1,5 @@
+# Install into conda env MaSIF:
+#   conda activate MaSIF && pip install -r requirements.txt
+dash>=3.0
+dash-bootstrap-components>=2.0
+pandas>=2.0
