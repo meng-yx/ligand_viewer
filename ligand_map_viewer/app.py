@@ -8,10 +8,8 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 from rdkit import Chem
 from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
-from st_aggrid.shared import GridUpdateMode
 
 from pdb_mapping import (
     build_py3dmol_html,
@@ -139,7 +137,7 @@ def _build_aggrid(df: pd.DataFrame):
     return AgGrid(
         df_show,
         gridOptions=grid_options,
-        update_mode=GridUpdateMode.SELECTION_CHANGED,
+        update_on="selectionChanged",
         height=min(1200, 80 + len(df_show) * ROW_HEIGHT),
         theme="streamlit",
         allow_unsafe_jscode=True,
@@ -206,7 +204,7 @@ def main():
                 st.error(f"Failed to load structure: {exc}")
                 return
 
-        components.html(st.session_state.viewer_html, height=620, scrolling=False)
+        st.html(st.session_state.viewer_html, unsafe_allow_javascript=True)
         st.markdown(st.session_state.viewer_caption)
         for w in st.session_state.viewer_warnings:
             st.warning(w)

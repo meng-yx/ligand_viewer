@@ -59,6 +59,7 @@ Pushes to the deployed branch redeploy automatically.
 | Issue | Fix |
 |-------|-----|
 | `ImportError` on `rdkit.Chem.Draw` / `rdMolDraw2D` | Commit root `packages.txt` + `ligand_map_viewer/environment.yml`; reboot app |
+| `AttributeError: _ARRAY_API not found` (NumPy 2.x) | Ensure `environment.yml` pins `numpy<2` (pip must not upgrade NumPy) |
 | `ModuleNotFoundError: rdkit` | Retry deploy; ensure `environment.yml` is used (not pip-only `requirements.txt`) |
 | CSV not found | Commit `specific_ligands.csv` at repo root |
 | Build timeout | Pin lighter versions in `requirements.txt` |
