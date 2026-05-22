@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 from rdkit import Chem
-from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
+from st_aggrid import AgGrid, JsCode
 
 from pdb_mapping import (
     build_py3dmol_html,
@@ -92,17 +93,8 @@ def _build_structure_view(
     return html, caption, warnings
 
 
-def _build_aggrid(df: pd.DataFrame):
-    display_cols = [c for c in df.columns if c != "structure"] + ["structure"]
-    df_show = df[display_cols].copy()
-    df_show["structure"] = df_show["structure"].fillna("")
-
-    gb = GridOptionsBuilder.from_dataframe(df_show)
-    gb.configure_default_column(filterable=True, sortable=True, resizable=True)
-    gb.configure_selection(selection_mode="single", use_checkbox=False)
-    gb.configure_grid_options(domLayout="normal", rowHeight=ROW_HEIGHT)
-
-    image_renderer = JsCode(
+def _structure_image_renderer() -> JsCode:
+    return JsCode(
         """
         class ImgRenderer {
           init(params) {
@@ -124,25 +116,146 @@ def _build_aggrid(df: pd.DataFrame):
         }
         """
     )
-    gb.configure_column(
-        "structure",
-        headerName="2D structure",
-        cellRenderer=image_renderer,
-        width=STRUCTURE_COL_WIDTH,
-    )
-    if "smiles" in df_show.columns:
-        gb.configure_column("smiles", width=220)
 
-    grid_options = gb.build()
+
+def _build_master_df(df: pd.DataFrame) -> pd.DataFrame:
+    """One master row per uniprot_id; ligands column is JSON for the detail grid."""
+    master_rows: list[dict] = []
+    # uniprot_id is the groupby index; sort only by display columns.
+    sort_cols = ["label", "protein_name"]
+    present = [c for c in sort_cols if c in df.columns]
+    grouped = df.groupby("uniprot_id", sort=False)
+    if present:
+        order = (
+            df.groupby("uniprot_id", sort=False)[present]
+            .first()
+            .sort_values(present)
+            .index
+        )
+    else:
+        order = sorted(grouped.groups.keys())
+
+    display_cols = [c for c in df.columns if c != "structure"] + ["structure"]
+    for uniprot_id in order:
+        group = grouped.get_group(uniprot_id)
+        detail = group[display_cols].copy()
+        detail["structure"] = detail["structure"].fillna("")
+        master_rows.append(
+            {
+                "uniprot_id": uniprot_id,
+                "label": group["label"].iloc[0] if "label" in group.columns else "",
+                "protein_name": group["protein_name"].iloc[0]
+                if "protein_name" in group.columns
+                else "",
+                "n_ligand_codes": int(group["ligand_code"].nunique()),
+                "ligands": json.dumps(detail.to_dict("records")),
+            }
+        )
+    return pd.DataFrame(master_rows)
+
+
+def _build_master_detail_grid(df: pd.DataFrame):
+    """Collapsed summary per UniProt; expand row for ligand table + 2D structures."""
+    master_df = _build_master_df(df)
+    image_renderer = _structure_image_renderer()
+
+    detail_column_defs = [
+        {"field": "label", "width": 70},
+        {"field": "pdb_id", "width": 90},
+        {"field": "ligand_code", "width": 100},
+        {"field": "ligand_name", "minWidth": 180},
+        {"field": "smiles", "width": 220},
+        {"field": "formula", "width": 120},
+        {"field": "mw", "width": 110},
+        {"field": "num_carbon", "headerName": "C atoms", "width": 90},
+        {
+            "field": "structure",
+            "headerName": "2D structure",
+            "cellRenderer": image_renderer,
+            "width": STRUCTURE_COL_WIDTH,
+        },
+    ]
+
+    grid_options = {
+        "masterDetail": True,
+        "detailRowAutoHeight": True,
+        "rowSelection": "single",
+        "suppressRowClickSelection": False,
+        "domLayout": "normal",
+        "rowHeight": 44,
+        "columnDefs": [
+            {
+                "field": "uniprot_id",
+                "cellRenderer": "agGroupCellRenderer",
+                "width": 120,
+            },
+            {"field": "label", "width": 70},
+            {"field": "protein_name", "minWidth": 200, "flex": 1},
+            {
+                "field": "n_ligand_codes",
+                "headerName": "Unique ligands",
+                "width": 140,
+            },
+            {"field": "ligands", "hide": True},
+        ],
+        "defaultColDef": {
+            "filterable": True,
+            "sortable": True,
+            "resizable": True,
+        },
+        "detailCellRendererParams": {
+            "detailGridOptions": {
+                "columnDefs": detail_column_defs,
+                "defaultColDef": {
+                    "filterable": True,
+                    "sortable": True,
+                    "resizable": True,
+                },
+                "rowSelection": "single",
+                "domLayout": "normal",
+                "rowHeight": ROW_HEIGHT,
+            },
+            "getDetailRowData": JsCode(
+                """function (params) {
+                    params.successCallback(JSON.parse(params.data.ligands));
+                }"""
+            ),
+        },
+    }
+
     return AgGrid(
-        df_show,
+        master_df,
         gridOptions=grid_options,
         update_on="selectionChanged",
-        height=min(1200, 80 + len(df_show) * ROW_HEIGHT),
+        height=min(900, 100 + len(master_df) * 48),
         theme="streamlit",
         allow_unsafe_jscode=True,
+        enable_enterprise_modules=True,
         fit_columns_on_grid_load=False,
+        key="ligand_master_detail_grid",
     )
+
+
+def _ligand_row_from_selection(selected) -> dict | None:
+    """Extract a ligand detail row (has pdb_id) from AgGrid selection."""
+    if selected is None:
+        return None
+    if isinstance(selected, pd.DataFrame):
+        if selected.empty:
+            return None
+        row = selected.iloc[0]
+    elif isinstance(selected, list):
+        if not selected:
+            return None
+        row = selected[0]
+    else:
+        return None
+
+    if isinstance(row, pd.Series):
+        row = row.to_dict()
+    if not isinstance(row, dict) or "pdb_id" not in row:
+        return None
+    return row
 
 
 def main():
@@ -162,26 +275,26 @@ def main():
 
     col_table, col_viewer = st.columns([2, 1], gap="medium")
 
+    n_proteins = df["uniprot_id"].nunique()
+
     with col_table:
         st.subheader("Ligand table")
-        st.caption(f"{len(df)} rows · {DEFAULT_CSV.name}")
-        grid_response = _build_aggrid(df)
-        selected = grid_response.get("selected_rows")
+        st.caption(
+            f"{n_proteins} proteins · {len(df)} ligand entries · "
+            f"expand a UniProt row for ligand details · {DEFAULT_CSV.name}"
+        )
+        grid_response = _build_master_detail_grid(df)
+        row = _ligand_row_from_selection(grid_response.get("selected_rows"))
 
     with col_viewer:
         st.subheader("3D structure")
-        row = None
-        if isinstance(selected, pd.DataFrame) and not selected.empty:
-            row = selected.iloc[0]
-        elif isinstance(selected, list) and len(selected) > 0:
-            row = selected[0]
 
         if row is None:
-            st.info("Select a row in the table to load the PDB structure.")
+            st.info(
+                "Expand a protein row, then select a ligand in the detail table "
+                "to load the PDB structure."
+            )
             return
-
-        if isinstance(row, pd.Series):
-            row = row.to_dict()
         pdb_id = row["pdb_id"]
         uniprot_id = row["uniprot_id"]
         ligand_code = row["ligand_code"]
