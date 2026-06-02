@@ -1,4 +1,6 @@
 logs/
 data/pdb_cache/
+data/uniprot_api_cache/
+data/pdb_api_cache/
 __pycache__/
 data/
