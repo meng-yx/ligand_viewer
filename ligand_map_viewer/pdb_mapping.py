@@ -346,38 +346,6 @@ def filter_structure_to_pdb_string(
     return pdb_string, resolved_protein, resolved_ligand, warnings
 
 
-def _first_ligand_residue(
-    pdb_string: str,
-    ligand_code: str,
-    ligand_chain_ids: list[str],
-) -> tuple[str, str, int] | None:
-    """Return (chain_id, resn, resi) for the first matching ligand residue in the PDB text."""
-    ligand_code = ligand_code.upper()
-    prefer_chains = set(ligand_chain_ids) if ligand_chain_ids else None
-
-    parser = PDBParser(QUIET=True)
-    structure = parser.get_structure("zoom", io.StringIO(pdb_string))
-
-    def _scan(only_preferred: bool) -> tuple[str, str, int] | None:
-        for model in structure:
-            for chain in model:
-                if only_preferred and prefer_chains is not None and chain.id not in prefer_chains:
-                    continue
-                for residue in chain:
-                    if residue.resname.strip().upper() != ligand_code:
-                        continue
-                    resseq = residue.id[1]
-                    if isinstance(resseq, int):
-                        return chain.id, residue.resname.strip(), resseq
-        return None
-
-    if prefer_chains:
-        hit = _scan(only_preferred=True)
-        if hit is not None:
-            return hit
-    return _scan(only_preferred=False)
-
-
 def build_py3dmol_html(
     pdb_string: str,
     protein_chain_ids: list[str],
@@ -416,11 +384,5 @@ def build_py3dmol_html(
         {"stick": {"colorscheme": LIGAND_COLOR}},
     )
 
-    ligand_residue = _first_ligand_residue(pdb_string, ligand_code, ligand_chain_ids)
-    if ligand_residue is not None:
-        chain_id, resn, resi = ligand_residue
-        view.zoomTo({"chain": chain_id, "resn": resn, "resi": resi})
-    else:
-        view.zoomTo({"resn": ligand_code.upper()})
-
+    view.zoomTo()
     return view._make_html()  # noqa: SLF001

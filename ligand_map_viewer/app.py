@@ -9,21 +9,26 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 from rdkit import Chem
-
-from datatable_ui import ligand_row_from_datatable, render_nested_ligand_table
-from pdb_mapping import (
-    build_py3dmol_html,
-    download_pdb,
-    filter_structure_to_pdb_string,
-    resolve_chains_and_ligands,
-)
+from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CSV = REPO_ROOT / "specific_ligands.csv"
-PDB_CACHE_DIR = REPO_ROOT / "data" / "pdb_cache"
 
 STRUCTURE_IMG_SIZE = (420, 320)
+ROW_HEIGHT = 240
+DETAIL_STRUCTURE_COL_WIDTH = 280
+SUMMARY_ROW_HEIGHT = 36
 
+DETAIL_COLUMNS = [
+    "pdb_id",
+    "ligand_code",
+    "ligand_name",
+    "smiles",
+    "formula",
+    "mw",
+    "num_carbon",
+    "structure",
+]
 
 def _smiles_to_base64(smiles: str | None, size: tuple[int, int] = STRUCTURE_IMG_SIZE) -> str | None:
     if not smiles or not isinstance(smiles, str) or not smiles.strip():
@@ -55,40 +60,141 @@ def load_table(csv_path: str, _structure_img_version: int = 2) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(show_spinner="Resolving chains via RCSB…")
-def _resolve_cached(pdb_id: str, uniprot_id: str, ligand_code: str) -> tuple[list[str], list[str], list[str]]:
-    return resolve_chains_and_ligands(pdb_id, uniprot_id, ligand_code)
+def _pdb_view_url(pdb_id: str) -> str:
+    return f"https://www.rcsb.org/3d-view/{str(pdb_id).upper()}"
 
 
-@st.cache_data(show_spinner="Downloading PDB…")
-def _get_pdb_path(pdb_id: str, cache_dir: str) -> str:
-    return str(download_pdb(pdb_id, Path(cache_dir)))
+def _is_liganded(series: pd.Series) -> pd.Series:
+    return series.fillna("").astype(str).str.strip().ne("")
 
 
-@st.cache_data(show_spinner="Building 3D view…")
-def _build_structure_view(
-    pdb_id: str,
-    uniprot_id: str,
-    ligand_code: str,
-    cache_dir: str,
-    _style_version: int = 3,
-) -> tuple[str | None, str, list[str]]:
-    """Returns (html, caption, warnings) or raises."""
-    protein_chains, ligand_chains, warnings = _resolve_cached(pdb_id, uniprot_id, ligand_code)
-    pdb_path = Path(_get_pdb_path(pdb_id, cache_dir))
-    pdb_string, protein_chains, ligand_chains, warnings = filter_structure_to_pdb_string(
-        pdb_path,
-        protein_chains,
-        ligand_chains,
-        ligand_code,
-        warnings,
+@st.cache_data(show_spinner=False)
+def build_summary_table(df: pd.DataFrame) -> pd.DataFrame:
+    base = df.copy()
+    base["is_liganded"] = _is_liganded(base["ligand_code"])
+    liganded = base[base["is_liganded"]]
+
+    agg: dict = {"pdb_entries": ("pdb_id", "nunique")}
+    if "protein_name" in base.columns:
+        agg["protein_name"] = ("protein_name", "first")
+
+    summary = base.groupby("uniprot_id", dropna=False).agg(**agg).reset_index()
+    liganded_counts = (
+        liganded.groupby("uniprot_id", dropna=False)
+        .agg(
+            liganded_structures=("pdb_id", "nunique"),
+            unique_ligands=("ligand_code", "nunique"),
+        )
+        .reset_index()
     )
-    html = build_py3dmol_html(pdb_string, protein_chains, ligand_chains, ligand_code)
-    caption = (
-        f"**{pdb_id}** · protein chains: `{', '.join(protein_chains) or '—'}` · "
-        f"ligand chains: `{', '.join(ligand_chains) or '—'}` ({ligand_code})"
+    summary = summary.merge(liganded_counts, on="uniprot_id", how="left")
+    summary["liganded_structures"] = summary["liganded_structures"].fillna(0).astype(int)
+    summary["unique_ligands"] = summary["unique_ligands"].fillna(0).astype(int)
+    summary = summary.sort_values(["liganded_structures", "pdb_entries", "uniprot_id"], ascending=[False, False, True])
+    col_order = ["uniprot_id", "protein_name", "pdb_entries", "liganded_structures", "unique_ligands"]
+    return summary[[c for c in col_order if c in summary.columns]]
+
+
+def _build_summary_aggrid(df: pd.DataFrame):
+    gb = GridOptionsBuilder.from_dataframe(df)
+    gb.configure_default_column(filterable=True, sortable=True, resizable=True)
+    gb.configure_selection(selection_mode="single", use_checkbox=False)
+    gb.configure_grid_options(domLayout="normal", rowHeight=SUMMARY_ROW_HEIGHT)
+    gb.configure_column("uniprot_id", headerName="UniProt ID", width=120)
+    gb.configure_column("protein_name", headerName="Protein", width=140)
+    gb.configure_column("pdb_entries", headerName="# PDB entries", width=130)
+    gb.configure_column("liganded_structures", headerName="# Liganded structures", width=170)
+    gb.configure_column("unique_ligands", headerName="# Unique ligands", width=140)
+
+    return AgGrid(
+        df,
+        gridOptions=gb.build(),
+        update_on=["selectionChanged"],
+        height=min(520, 80 + len(df) * SUMMARY_ROW_HEIGHT),
+        theme="streamlit",
+        fit_columns_on_grid_load=False,
     )
-    return html, caption, warnings
+
+
+def _build_detail_aggrid(df: pd.DataFrame):
+    cols = [c for c in DETAIL_COLUMNS if c in df.columns]
+    df_show = df[cols].copy()
+    if "structure" in df_show.columns:
+        df_show["structure"] = df_show["structure"].fillna("")
+
+    gb = GridOptionsBuilder.from_dataframe(df_show)
+    gb.configure_default_column(filterable=True, sortable=True, resizable=True)
+    gb.configure_selection(selection_mode="single", use_checkbox=False)
+    gb.configure_grid_options(domLayout="normal", rowHeight=ROW_HEIGHT)
+
+    image_renderer = JsCode(
+        """
+        class ImgRenderer {
+          init(params) {
+            this.eGui = document.createElement('div');
+            this.eGui.style.display = 'flex';
+            this.eGui.style.alignItems = 'center';
+            this.eGui.style.height = '100%%';
+            if (params.value) {
+              const img = document.createElement('img');
+              img.src = 'data:image/png;base64,' + params.value;
+              img.style.height = '220px';
+              img.style.maxWidth = '260px';
+              img.style.objectFit = 'contain';
+              this.eGui.appendChild(img);
+            }
+          }
+          getGui() { return this.eGui; }
+          refresh() { return false; }
+        }
+        """
+    )
+    gb.configure_column("pdb_id", width=90)
+    gb.configure_column("ligand_code", width=100)
+    gb.configure_column("ligand_name", width=160)
+    gb.configure_column("smiles", width=180)
+    gb.configure_column("formula", width=110)
+    gb.configure_column("mw", width=80)
+    gb.configure_column("num_carbon", width=90)
+    gb.configure_column(
+        "structure",
+        headerName="2D structure",
+        cellRenderer=image_renderer,
+        width=DETAIL_STRUCTURE_COL_WIDTH,
+    )
+
+    grid_options = gb.build()
+    return AgGrid(
+        df_show,
+        gridOptions=grid_options,
+        update_on=["selectionChanged"],
+        height=min(1200, 80 + len(df_show) * ROW_HEIGHT),
+        theme="streamlit",
+        allow_unsafe_jscode=True,
+        fit_columns_on_grid_load=False,
+    )
+
+
+def _extract_selected_row(selected) -> dict | None:
+    """Return first selected row as a dict across st-aggrid return formats."""
+    if isinstance(selected, pd.DataFrame):
+        if selected.empty:
+            return None
+        return selected.iloc[0].to_dict()
+
+    if isinstance(selected, list):
+        if not selected:
+            return None
+        first = selected[0]
+        if isinstance(first, pd.Series):
+            return first.to_dict()
+        if isinstance(first, dict):
+            return first
+
+    if isinstance(selected, dict):
+        return selected
+
+    return None
 
 
 def main():
@@ -99,63 +205,58 @@ def main():
         st.error(f"CSV not found: {DEFAULT_CSV}")
         st.stop()
 
-    if "viewer_html" not in st.session_state:
-        st.session_state.viewer_html = None
-        st.session_state.viewer_caption = None
-        st.session_state.viewer_warnings = []
-
     df = load_table(str(DEFAULT_CSV))
 
-    col_table, col_viewer = st.columns([2, 1], gap="medium")
+    summary_df = build_summary_table(df)
 
-    n_proteins = df["uniprot_id"].nunique()
-    ligand_row: dict | None = None
+    col_table, col_viewer = st.columns([3, 2], gap="medium")
 
     with col_table:
-        st.subheader("Ligand table")
-        st.caption(
-            f"{n_proteins} proteins · {len(df)} ligand entries · "
-            f"expand a UniProt row for ligand details · {DEFAULT_CSV.name}"
-        )
-        grid_response = render_nested_ligand_table(df)
-        ligand_row = ligand_row_from_datatable(grid_response)
+        st.subheader("UniProt summary")
+        st.caption(f"{summary_df['uniprot_id'].nunique()} UniProt IDs · source: {DEFAULT_CSV.name}")
+        summary_response = _build_summary_aggrid(summary_df)
+        summary_selected = _extract_selected_row(summary_response.get("selected_rows"))
+
+        st.divider()
+        st.subheader("PDB details")
+
+        if summary_selected is None:
+            st.info("Select a UniProt row above.")
+            detail_selected = None
+        else:
+            selected_uniprot = str(summary_selected["uniprot_id"])
+            view_mode = st.segmented_control(
+                "Show",
+                options=["Liganded", "All"],
+                default="Liganded",
+                key="detail_view_mode",
+            )
+            detail_df = df[df["uniprot_id"].astype(str) == selected_uniprot].copy()
+            if view_mode == "Liganded":
+                detail_df = detail_df[_is_liganded(detail_df["ligand_code"])]
+
+            st.caption(
+                f"{selected_uniprot} · {len(detail_df)} rows · "
+                f"mode: {view_mode}"
+            )
+            if detail_df.empty:
+                st.warning("No rows for this UniProt under the selected mode.")
+                detail_selected = None
+            else:
+                detail_response = _build_detail_aggrid(detail_df)
+                detail_selected = _extract_selected_row(detail_response.get("selected_rows"))
 
     with col_viewer:
         st.subheader("3D structure")
-
-        if ligand_row is None:
-            st.info(
-                "Expand a protein row, then click a ligand in the nested table "
-                "(e.g. pdb_id or ligand_code) to load the PDB structure."
-            )
+        if detail_selected is None:
+            st.info("Select a row in the bottom table to load the PDB structure.")
             return
 
-        pdb_id = ligand_row["pdb_id"]
-        uniprot_id = ligand_row["uniprot_id"]
-        ligand_code = ligand_row["ligand_code"]
-
-        with st.spinner(f"Loading {pdb_id} ({ligand_code})…"):
-            try:
-                html, caption, warnings = _build_structure_view(
-                    str(pdb_id),
-                    str(uniprot_id),
-                    str(ligand_code),
-                    str(PDB_CACHE_DIR),
-                )
-                st.session_state.viewer_html = html
-                st.session_state.viewer_caption = caption
-                st.session_state.viewer_warnings = warnings
-            except Exception as exc:
-                st.session_state.viewer_html = None
-                st.session_state.viewer_caption = None
-                st.session_state.viewer_warnings = []
-                st.error(f"Failed to load structure: {exc}")
-                return
-
-        st.html(st.session_state.viewer_html, unsafe_allow_javascript=True)
-        st.markdown(st.session_state.viewer_caption)
-        for w in st.session_state.viewer_warnings:
-            st.warning(w)
+        pdb_id = str(detail_selected["pdb_id"]).upper()
+        view_url = _pdb_view_url(pdb_id)
+        st.markdown(f"**PDB:** `{pdb_id}`")
+        st.link_button("Open RCSB 3D View", view_url, use_container_width=True)
+        st.components.v1.iframe(view_url, height=760, scrolling=True)
 
 
 if __name__ == "__main__":
