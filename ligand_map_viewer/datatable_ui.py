@@ -116,6 +116,7 @@ def render_nested_ligand_table(df: pd.DataFrame, *, key: str = "ligand_nested_gr
     return st_datatable(
         nested_rows,
         options=options,
+        dt_config=None,
         common_js_functions=common_js_functions,
         override_click_response=True,
         on_select="rerun",
