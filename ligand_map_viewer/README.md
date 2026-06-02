@@ -1,6 +1,6 @@
 # Ligand map viewer
 
-Interactive Streamlit app for `specific_ligands.csv`: a collapsible master table (one row per UniProt with unique-ligand counts), expandable ligand detail rows with 2D SMILES structures, row selection, and 3D PDB views (py3Dmol).
+Interactive Streamlit app for `specific_ligands.csv`: protein/ligand dropdowns, an AgGrid ligand table with 2D SMILES structures (optional row checkboxes), and 3D PDB views (py3Dmol).
 
 Related data files at repo root (from `notebooks/uniprot_pdb_ligand_mapping.ipynb`):
 
