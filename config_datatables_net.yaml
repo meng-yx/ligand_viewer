@@ -1,5 +1,0 @@
-default:
-  class_name: "compact row-border hover nowrap"
-  js_scripts: []
-  stylesheets: []
-  options: {}
