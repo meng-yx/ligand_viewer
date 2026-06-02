@@ -12,27 +12,36 @@ from rdkit import Chem
 from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CSV = REPO_ROOT / "specific_ligands.csv"
+DEFAULT_CSV = REPO_ROOT / "all_ligands.csv"
 
 STRUCTURE_IMG_SIZE = (420, 320)
 ROW_HEIGHT = 240
 DETAIL_STRUCTURE_COL_WIDTH = 280
 SUMMARY_ROW_HEIGHT = 36
 
-DETAIL_COLUMNS = [
+ALWAYS_DETAIL_COLUMNS = [
+    "uniprot_id",
+    "gene_name",
+    "recommendedName",
     "pdb_id",
     "ligand_code",
     "ligand_name",
     "smiles",
-    "formula",
-    "mw",
-    "num_carbon",
     "structure",
 ]
+DEFAULT_OPTIONAL_DETAIL_COLUMNS = ["qed"]
 
-def _smiles_to_base64(smiles: str | None, size: tuple[int, int] = STRUCTURE_IMG_SIZE) -> str | None:
-    if not smiles or not isinstance(smiles, str) or not smiles.strip():
-        return None
+DEFAULT_FILTER_RANGES = {
+    "mw": (100, None),
+    "num_carbon": (5, None),
+    "num_N_O": (1, None),
+    "qed": (0.0, 1.0),
+    "uniprot_id_count": (1, 1),
+}
+
+
+
+def _smiles_to_base64(smiles: str, size: tuple[int, int] = STRUCTURE_IMG_SIZE) -> str | None:
     try:
         from rdkit.Chem import Draw
     except ImportError as exc:
@@ -50,14 +59,33 @@ def _smiles_to_base64(smiles: str | None, size: tuple[int, int] = STRUCTURE_IMG_
 
 
 @st.cache_data(show_spinner=False)
-def load_table(csv_path: str, _structure_img_version: int = 2) -> pd.DataFrame:
-    df = pd.read_csv(csv_path)
-    structures = []
-    for smi in df["smiles"]:
-        structures.append(_smiles_to_base64(smi))
-    df = df.copy()
-    df["structure"] = structures
-    return df
+def _cached_smiles_to_base64(smiles: str) -> str | None:
+    """Per-SMILES PNG cache; only invoked for rows shown in the detail table."""
+    return _smiles_to_base64(smiles)
+
+
+@st.cache_data(show_spinner=False)
+def load_table(csv_path: str) -> pd.DataFrame:
+    return pd.read_csv(csv_path)
+
+
+def attach_structure_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Add structure PNG column for visible detail rows only."""
+    out = df.copy()
+    if "smiles" not in out.columns:
+        out["structure"] = ""
+        return out
+
+    structures: list[str] = []
+    for smi in out["smiles"]:
+        if pd.isna(smi) or not str(smi).strip():
+            structures.append("")
+            continue
+        smi_str = str(smi).strip()
+        b64 = _cached_smiles_to_base64(smi_str)
+        structures.append(b64 or "")
+    out["structure"] = structures
+    return out
 
 
 def _pdb_view_url(pdb_id: str) -> str:
@@ -68,30 +96,181 @@ def _is_liganded(series: pd.Series) -> pd.Series:
     return series.fillna("").astype(str).str.strip().ne("")
 
 
+def _optional_detail_columns(df: pd.DataFrame) -> list[str]:
+    excluded = set(ALWAYS_DETAIL_COLUMNS) | {"is_liganded", "is_valid_ligand"}
+    return [c for c in df.columns if c not in excluded]
+
+
+def _numeric_ligand_filter_columns(df: pd.DataFrame) -> list[str]:
+    """Optional columns with at least one numeric value among ligand-coded rows."""
+    if "ligand_code" not in df.columns:
+        return []
+    liganded = df[_is_liganded(df["ligand_code"])]
+    numeric_cols: list[str] = []
+    for col in _optional_detail_columns(df):
+        if col not in liganded.columns:
+            continue
+        if pd.to_numeric(liganded[col], errors="coerce").notna().any():
+            numeric_cols.append(col)
+    return numeric_cols
+
+
+def _ligand_filter_numeric_series(df: pd.DataFrame, col: str) -> pd.Series:
+    if "ligand_code" not in df.columns or col not in df.columns:
+        return pd.Series(dtype=float)
+    liganded = df[_is_liganded(df["ligand_code"])]
+    return pd.to_numeric(liganded[col], errors="coerce").dropna()
+
+
+def _is_integer_column(numeric: pd.Series) -> bool:
+    if numeric.empty:
+        return False
+    return bool((numeric % 1).abs().max() < 1e-9)
+
+
+def _ligand_filter_bounds(df: pd.DataFrame, col: str) -> tuple[float, float, bool] | None:
+    numeric = _ligand_filter_numeric_series(df, col)
+    if numeric.empty:
+        return None
+    min_val, max_val = float(numeric.min()), float(numeric.max())
+    return min_val, max_val, _is_integer_column(numeric)
+
+
+def _resolve_default_slider_range(
+    col_name: str,
+    min_val: float,
+    max_val: float,
+    use_int: bool,
+) -> tuple[float, float]:
+    """Map DEFAULT_FILTER_RANGES onto data bounds; None uses min/max from data."""
+    default_lo, default_hi = DEFAULT_FILTER_RANGES.get(col_name, (None, None))
+    lo = float(min_val if default_lo is None else default_lo)
+    hi = float(max_val if default_hi is None else default_hi)
+    lo = max(min_val, min(lo, max_val))
+    hi = max(min_val, min(hi, max_val))
+    if lo > hi:
+        lo, hi = hi, lo
+    if use_int:
+        lo, hi = int(round(lo)), int(round(hi))
+    return float(lo), float(hi)
+
+
+def render_ligand_filters(df: pd.DataFrame) -> dict[str, tuple[float, float]]:
+    """Render global ligand-qualification sliders; returns per-column [min, max] ranges."""
+    filter_cols = _numeric_ligand_filter_columns(df)
+    ranges: dict[str, tuple[float, float]] = {}
+
+    with st.expander("Ligand filters", expanded=True):
+        st.caption(
+            "Valid ligand = non-empty ligand_code and within all numeric ranges below. "
+        )
+        if not filter_cols:
+            st.info("No numeric optional columns available for ligand filtering.")
+            return ranges
+
+        cols_per_row = 3
+        for row_start in range(0, len(filter_cols), cols_per_row):
+            row_cols = st.columns(cols_per_row)
+            for col_name, ui_col in zip(filter_cols[row_start : row_start + cols_per_row], row_cols):
+                bounds = _ligand_filter_bounds(df, col_name)
+                if bounds is None:
+                    continue
+                min_val, max_val, use_int = bounds
+                if use_int:
+                    min_val, max_val = int(round(min_val)), int(round(max_val))
+                default_lo, default_hi = _resolve_default_slider_range(
+                    col_name, float(min_val), float(max_val), use_int
+                )
+                with ui_col:
+                    if min_val == max_val:
+                        label = f"{min_val}" if use_int else f"{min_val:g}"
+                        st.caption(f"**{col_name}**: fixed at {label}")
+                        ranges[col_name] = (float(min_val), float(max_val))
+                    elif use_int:
+                        selected = st.slider(
+                            col_name,
+                            min_value=min_val,
+                            max_value=max_val,
+                            value=(int(default_lo), int(default_hi)),
+                            step=1,
+                            key=f"ligand_filter_{col_name}",
+                        )
+                        ranges[col_name] = (float(selected[0]), float(selected[1]))
+                    else:
+                        selected = st.slider(
+                            col_name,
+                            min_value=min_val,
+                            max_value=max_val,
+                            value=(default_lo, default_hi),
+                            key=f"ligand_filter_{col_name}",
+                        )
+                        ranges[col_name] = (float(selected[0]), float(selected[1]))
+    return ranges
+
+
+def _ranges_cache_key(ranges: dict[str, tuple[float, float]]) -> tuple[tuple[str, float, float], ...]:
+    return tuple(sorted((col, lo, hi) for col, (lo, hi) in ranges.items()))
+
+
+def valid_ligand_mask(df: pd.DataFrame, filter_ranges: dict[str, tuple[float, float]]) -> pd.Series:
+    """True when row has ligand_code and passes all numeric ligand filter ranges."""
+    if "ligand_code" not in df.columns:
+        return pd.Series(False, index=df.index)
+    mask = _is_liganded(df["ligand_code"])
+    for col, (lo, hi) in filter_ranges.items():
+        if col not in df.columns:
+            mask &= False
+            continue
+        numeric = pd.to_numeric(df[col], errors="coerce")
+        in_range = numeric.ge(lo) & numeric.le(hi)
+        mask &= in_range.fillna(False)
+    return mask
+
+
 @st.cache_data(show_spinner=False)
-def build_summary_table(df: pd.DataFrame) -> pd.DataFrame:
+def build_summary_table(df: pd.DataFrame, filter_ranges_key: tuple[tuple[str, float, float], ...]) -> pd.DataFrame:
+    filter_ranges = {col: (lo, hi) for col, lo, hi in filter_ranges_key}
     base = df.copy()
-    base["is_liganded"] = _is_liganded(base["ligand_code"])
-    liganded = base[base["is_liganded"]]
+    base["qed_num"] = pd.to_numeric(base["qed"], errors="coerce") if "qed" in base.columns else float("nan")
+    base["is_valid_ligand"] = valid_ligand_mask(base, filter_ranges)
+    valid_ligands = base[base["is_valid_ligand"]]
 
     agg: dict = {"pdb_entries": ("pdb_id", "nunique")}
-    if "protein_name" in base.columns:
-        agg["protein_name"] = ("protein_name", "first")
+    if "gene_name" in base.columns:
+        agg["gene_name"] = ("gene_name", "first")
+    if "recommendedName" in base.columns:
+        agg["recommendedName"] = ("recommendedName", "first")
 
     summary = base.groupby("uniprot_id", dropna=False).agg(**agg).reset_index()
     liganded_counts = (
-        liganded.groupby("uniprot_id", dropna=False)
+        valid_ligands.groupby("uniprot_id", dropna=False)
         .agg(
             liganded_structures=("pdb_id", "nunique"),
             unique_ligands=("ligand_code", "nunique"),
         )
         .reset_index()
     )
+    qed_summary = (
+        valid_ligands.groupby("uniprot_id", dropna=False)["qed_num"]
+        .median()
+        .fillna(0)
+        .reset_index(name="median_qed")
+    )
     summary = summary.merge(liganded_counts, on="uniprot_id", how="left")
+    summary = summary.merge(qed_summary, on="uniprot_id", how="left")
     summary["liganded_structures"] = summary["liganded_structures"].fillna(0).astype(int)
     summary["unique_ligands"] = summary["unique_ligands"].fillna(0).astype(int)
+    summary["median_qed"] = summary["median_qed"].fillna(0.0)
     summary = summary.sort_values(["liganded_structures", "pdb_entries", "uniprot_id"], ascending=[False, False, True])
-    col_order = ["uniprot_id", "protein_name", "pdb_entries", "liganded_structures", "unique_ligands"]
+    col_order = [
+        "uniprot_id",
+        "gene_name",
+        "recommendedName",
+        "pdb_entries",
+        "liganded_structures",
+        "unique_ligands",
+        "median_qed",
+    ]
     return summary[[c for c in col_order if c in summary.columns]]
 
 
@@ -101,10 +280,12 @@ def _build_summary_aggrid(df: pd.DataFrame):
     gb.configure_selection(selection_mode="single", use_checkbox=False)
     gb.configure_grid_options(domLayout="normal", rowHeight=SUMMARY_ROW_HEIGHT)
     gb.configure_column("uniprot_id", headerName="UniProt ID", width=120)
-    gb.configure_column("protein_name", headerName="Protein", width=140)
+    gb.configure_column("gene_name", headerName="Gene", width=110)
+    gb.configure_column("recommendedName", headerName="Recommended name", width=260)
     gb.configure_column("pdb_entries", headerName="# PDB entries", width=130)
     gb.configure_column("liganded_structures", headerName="# Liganded structures", width=170)
     gb.configure_column("unique_ligands", headerName="# Unique ligands", width=140)
+    gb.configure_column("median_qed", headerName="median_qed", width=110)
 
     return AgGrid(
         df,
@@ -116,8 +297,8 @@ def _build_summary_aggrid(df: pd.DataFrame):
     )
 
 
-def _build_detail_aggrid(df: pd.DataFrame):
-    cols = [c for c in DETAIL_COLUMNS if c in df.columns]
+def _build_detail_aggrid(df: pd.DataFrame, display_cols: list[str]):
+    cols = [c for c in display_cols if c in df.columns]
     df_show = df[cols].copy()
     if "structure" in df_show.columns:
         df_show["structure"] = df_show["structure"].fillna("")
@@ -150,12 +331,15 @@ def _build_detail_aggrid(df: pd.DataFrame):
         """
     )
     gb.configure_column("pdb_id", width=90)
+    gb.configure_column("uniprot_id", width=110)
+    gb.configure_column("gene_name", width=100)
+    gb.configure_column("recommendedName", width=220)
     gb.configure_column("ligand_code", width=100)
     gb.configure_column("ligand_name", width=160)
     gb.configure_column("smiles", width=180)
-    gb.configure_column("formula", width=110)
-    gb.configure_column("mw", width=80)
-    gb.configure_column("num_carbon", width=90)
+    for optional_col in ["formula", "mw", "qed", "num_carbon", "num_N_O", "uniprot_id_count"]:
+        if optional_col in df_show.columns:
+            gb.configure_column(optional_col, width=100)
     gb.configure_column(
         "structure",
         headerName="2D structure",
@@ -206,8 +390,9 @@ def main():
         st.stop()
 
     df = load_table(str(DEFAULT_CSV))
-
-    summary_df = build_summary_table(df)
+    ligand_filter_ranges = render_ligand_filters(df)
+    filter_ranges_key = _ranges_cache_key(ligand_filter_ranges)
+    summary_df = build_summary_table(df, filter_ranges_key)
 
     col_table, col_viewer = st.columns([3, 2], gap="medium")
 
@@ -225,15 +410,32 @@ def main():
             detail_selected = None
         else:
             selected_uniprot = str(summary_selected["uniprot_id"])
-            view_mode = st.segmented_control(
-                "Show",
-                options=["Liganded", "All"],
-                default="Liganded",
-                key="detail_view_mode",
-            )
             detail_df = df[df["uniprot_id"].astype(str) == selected_uniprot].copy()
+
+            optional_cols = _optional_detail_columns(detail_df)
+            default_optional = [c for c in DEFAULT_OPTIONAL_DETAIL_COLUMNS if c in optional_cols]
+
+            ctrl_mode, ctrl_cols = st.columns([1, 2], gap="medium")
+            with ctrl_mode:
+                view_mode = st.segmented_control(
+                    "Show",
+                    options=["Liganded", "All"],
+                    default="Liganded",
+                    key="detail_view_mode",
+                )
+            with ctrl_cols:
+                selected_optional_cols = st.multiselect(
+                    "Optional columns",
+                    options=optional_cols,
+                    default=default_optional,
+                    help="Always-on columns are fixed; choose additional columns to display.",
+                    key="detail_optional_columns",
+                )
+
             if view_mode == "Liganded":
-                detail_df = detail_df[_is_liganded(detail_df["ligand_code"])]
+                detail_df = detail_df[valid_ligand_mask(detail_df, ligand_filter_ranges)]
+
+            display_cols = ALWAYS_DETAIL_COLUMNS + selected_optional_cols
 
             st.caption(
                 f"{selected_uniprot} · {len(detail_df)} rows · "
@@ -243,7 +445,9 @@ def main():
                 st.warning("No rows for this UniProt under the selected mode.")
                 detail_selected = None
             else:
-                detail_response = _build_detail_aggrid(detail_df)
+                with st.spinner("Generating 2D structures for visible rows…"):
+                    detail_df = attach_structure_column(detail_df)
+                detail_response = _build_detail_aggrid(detail_df, display_cols=display_cols)
                 detail_selected = _extract_selected_row(detail_response.get("selected_rows"))
 
     with col_viewer:
