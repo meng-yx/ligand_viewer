@@ -14,11 +14,21 @@ function formatLigandChild(row) {
         "C atoms",
         "2D structure",
     ];
-    let html =
-        '<table class="ligand-child-table display compact stripe hover" style="width:100%">';
+    const headerClasses = [
+        "ligand-col-label",
+        "ligand-col-pdb",
+        "ligand-col-code",
+        "ligand-col-name",
+        "ligand-col-formula",
+        "ligand-col-mw",
+        "ligand-col-carbon",
+        "ligand-col-structure",
+    ];
+    let html = '<div class="ligand-child-wrap">';
+    html += '<table class="ligand-child-table display compact stripe hover">';
     html += "<thead><tr>";
     for (let i = 0; i < headers.length; i++) {
-        html += "<th>" + headers[i] + "</th>";
+        html += '<th class="' + headerClasses[i] + '">' + headers[i] + "</th>";
     }
     html += "</tr></thead><tbody>";
 
@@ -50,17 +60,17 @@ function formatLigandChild(row) {
             'data-formula="' + esc(lig.formula) + '" ' +
             'data-mw="' + esc(lig.mw) + '" ' +
             'data-num-carbon="' + esc(lig.num_carbon) + '">';
-        html += "<td>" + esc(lig.label) + "</td>";
-        html += "<td>" + esc(lig.pdb_id) + "</td>";
-        html += "<td>" + esc(lig.ligand_code) + "</td>";
-        html += "<td>" + esc(lig.ligand_name) + "</td>";
-        html += "<td>" + esc(lig.formula) + "</td>";
-        html += "<td>" + esc(lig.mw) + "</td>";
-        html += "<td>" + esc(lig.num_carbon) + "</td>";
-        html += "<td>" + structureCell + "</td>";
+        html += '<td class="ligand-col-label">' + esc(lig.label) + "</td>";
+        html += '<td class="ligand-col-pdb">' + esc(lig.pdb_id) + "</td>";
+        html += '<td class="ligand-col-code">' + esc(lig.ligand_code) + "</td>";
+        html += '<td class="ligand-col-name">' + esc(lig.ligand_name) + "</td>";
+        html += '<td class="ligand-col-formula">' + esc(lig.formula) + "</td>";
+        html += '<td class="ligand-col-mw">' + esc(lig.mw) + "</td>";
+        html += '<td class="ligand-col-carbon">' + esc(lig.num_carbon) + "</td>";
+        html += '<td class="ligand-col-structure">' + structureCell + "</td>";
         html += "</tr>";
     }
-    html += "</tbody></table>";
+    html += "</tbody></table></div>";
     return html;
 }
 
@@ -77,39 +87,47 @@ function wireNestedLigandTable() {
     if (!tableId) {
         return;
     }
-    if (window.__ligandNestedTableWired === tableId) {
+    const tableEl = table.table().node();
+    if (!tableEl) {
         return;
     }
-    window.__ligandNestedTableWired = tableId;
 
-    const $table = window.jQuery("#" + tableId);
+    // Rebind on every rerender safely (same id, fresh DOM/table instance).
+    if (window.__ligandNestedClickHandler) {
+        tableEl.removeEventListener("click", window.__ligandNestedClickHandler);
+    }
 
-    $table.on("click", "tbody td.dt-control", function (e) {
-        e.stopPropagation();
-        const tr = window.jQuery(this).closest("tr");
-        const row = table.row(tr);
-        if (row.child.isShown()) {
-            row.child.hide();
-            tr.removeClass("dt-hasChild");
-        } else {
-            const html = window.commonJsFunctions.formatLigandChild(row.data());
-            row.child(html).show();
-            tr.addClass("dt-hasChild");
+    window.__ligandNestedClickHandler = function (e) {
+        const controlCell = e.target.closest("td.dt-control");
+        if (controlCell && tableEl.contains(controlCell)) {
+            e.stopPropagation();
+            const tr = controlCell.closest("tr");
+            const row = table.row(tr);
+            if (row.child.isShown()) {
+                row.child.hide();
+                tr.classList.remove("dt-hasChild");
+            } else {
+                const html = window.commonJsFunctions.formatLigandChild(row.data());
+                row.child(html).show();
+                tr.classList.add("dt-hasChild");
+            }
+            return;
         }
-    });
 
-    $table.on("click", ".ligand-select-row", function (e) {
+        const ligandEl = e.target.closest(".ligand-select-row");
+        if (!ligandEl || !tableEl.contains(ligandEl)) {
+            return;
+        }
         e.stopPropagation();
-        const el = window.jQuery(this);
         const ligand = {
-            uniprot_id: el.data("uniprotId"),
-            pdb_id: el.data("pdbId"),
-            ligand_code: el.data("ligandCode"),
-            label: el.data("label"),
-            ligand_name: el.data("ligandName"),
-            formula: el.data("formula"),
-            mw: el.data("mw"),
-            num_carbon: el.data("numCarbon"),
+            uniprot_id: ligandEl.dataset.uniprotId,
+            pdb_id: ligandEl.dataset.pdbId,
+            ligand_code: ligandEl.dataset.ligandCode,
+            label: ligandEl.dataset.label,
+            ligand_name: ligandEl.dataset.ligandName,
+            formula: ligandEl.dataset.formula,
+            mw: ligandEl.dataset.mw,
+            num_carbon: ligandEl.dataset.numCarbon,
         };
         if (!ligand.pdb_id) {
             return;
@@ -118,14 +136,26 @@ function wireNestedLigandTable() {
             data: ligand,
             eventType: "ligandClick",
         });
-        $table.find(".ligand-select-row").removeClass("ligand-selected");
-        el.addClass("ligand-selected");
-    });
+        const selected = tableEl.querySelectorAll(".ligand-select-row.ligand-selected");
+        selected.forEach(function (node) {
+            node.classList.remove("ligand-selected");
+        });
+        ligandEl.classList.add("ligand-selected");
+    };
+
+    tableEl.addEventListener("click", window.__ligandNestedClickHandler);
 }
 
 function renderDtControl(data, type, row, meta) {
     if (type === "display" && meta.row === 0) {
-        window.commonJsFunctions.wireNestedLigandTable();
+        window.setTimeout(function () {
+            if (
+                window.commonJsFunctions &&
+                typeof window.commonJsFunctions.wireNestedLigandTable === "function"
+            ) {
+                window.commonJsFunctions.wireNestedLigandTable();
+            }
+        }, 0);
     }
     return "";
 }

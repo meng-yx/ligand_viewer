@@ -90,7 +90,11 @@ def render_nested_ligand_table(df: pd.DataFrame, *, key: str = "ligand_nested_gr
         "data": nested_rows,
         "order": [[1, "asc"]],
         "scrollX": True,
+        "scrollY": "520px",
+        "scrollCollapse": True,
         "stateSave": False,
+        "paging": False,
+        "autoWidth": False,
         "layout": {"topStart": "search"},
         "select": False,
     }
@@ -104,7 +108,33 @@ def render_nested_ligand_table(df: pd.DataFrame, *, key: str = "ligand_nested_gr
     st.markdown(
         """
         <style>
-        .ligand-child-table { margin: 8px 0 8px 36px; font-size: 13px; }
+        div.dt-container div.dt-scroll-body { max-height: 520px !important; }
+        div.dt-container table.dataTable { width: 100% !important; }
+        .ligand-child-wrap {
+            max-height: 460px;
+            overflow-y: auto;
+            overflow-x: auto;
+            margin: 4px 0 0 0;
+            padding: 0 0 14px 0;
+            box-sizing: border-box;
+        }
+        tr.dt-hasChild > td { overflow: visible !important; padding-bottom: 10px !important; }
+        .ligand-child-table {
+            margin: 0;
+            font-size: 13px;
+            table-layout: fixed;
+            min-width: 980px;
+            width: max-content !important;
+        }
+        .ligand-child-table th,
+        .ligand-child-table td { white-space: nowrap; }
+        .ligand-child-table th.ligand-col-name,
+        .ligand-child-table td.ligand-col-name {
+            min-width: 260px;
+            max-width: 420px;
+            white-space: normal;
+            word-break: break-word;
+        }
         .ligand-select-row { cursor: pointer; }
         .ligand-select-row.ligand-selected { background-color: #ffebee !important; }
         td.dt-control { cursor: pointer; }
@@ -116,7 +146,7 @@ def render_nested_ligand_table(df: pd.DataFrame, *, key: str = "ligand_nested_gr
     return st_datatable(
         nested_rows,
         options=options,
-        dt_config=None,
+        dt_config="default",
         common_js_functions=common_js_functions,
         override_click_response=True,
         on_select="rerun",
