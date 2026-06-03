@@ -10,6 +10,9 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import shutil
+import subprocess
+import tempfile
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,7 +33,10 @@ OUTPUT_COLUMNS = [
     "ligand_code",
     "ligand_name",
     "smiles",
+    "percent_intracellular",
 ]
+
+DEFAULT_DEEPTMHMM_DIR = Path("/work/upthomae/Meng/hp_list_DeepTMHMM/out/3line")
 
 CacheSource = Literal["uniprot", "pdb"]
 
@@ -38,6 +44,10 @@ CacheSource = Literal["uniprot", "pdb"]
 _API_CACHE: Optional["ApiCache"] = None
 _WRITE_LOCKS: Dict[str, threading.Lock] = {}
 _WRITE_LOCKS_GUARD = threading.Lock()
+_DEEPTMHMM_DIR: Optional[Path] = None
+_DEEPTMHMM_ENABLED: bool = True
+_3LINE_CACHE: Dict[str, Optional[Tuple[str, str]]] = {}
+_3LINE_CACHE_LOCK = threading.Lock()
 
 
 class ApiCache:
@@ -146,6 +156,12 @@ def _init_api_cache(
 ) -> None:
     global _API_CACHE
     _API_CACHE = ApiCache(uniprot_dir, pdb_dir, enabled=enabled, refresh=refresh)
+
+
+def _init_deeptmhmm(deeptmhmm_dir: Path, *, enabled: bool) -> None:
+    global _DEEPTMHMM_DIR, _DEEPTMHMM_ENABLED
+    _DEEPTMHMM_DIR = deeptmhmm_dir
+    _DEEPTMHMM_ENABLED = enabled
 
 
 def _fetch_uniprot_json(uniprot_id: str) -> Tuple[Optional[Dict[str, Any]], int]:
@@ -265,6 +281,175 @@ def _build_polymer_uniprot_maps(
                 asym_to_uniprot[asym_id] = uniprot_ids
 
     return entity_to_uniprot, asym_to_uniprot, label_asym_to_auth
+
+
+def _polymer_sequence_for_auth_chain(
+    pdb_id: str, protein_chain: str, polymer_entity_ids: Sequence[str]
+) -> Optional[str]:
+    """Return one-letter polymer sequence for an auth/label/strand chain ID."""
+    chain = protein_chain.strip()
+    for entity_id in polymer_entity_ids:
+        data, status = _fetch_pdb_core_json(f"polymer_entity/{pdb_id}/{entity_id}")
+        if status != 200 or data is None:
+            continue
+        container = data.get("rcsb_polymer_entity_container_identifiers") or {}
+        auth_ids = [str(value) for value in (container.get("auth_asym_ids") or [])]
+        asym_ids = [str(value) for value in (container.get("asym_ids") or [])]
+        strand_raw = (data.get("entity_poly") or {}).get("pdbx_strand_id") or ""
+        strand_ids = [part.strip() for part in str(strand_raw).split(",") if part.strip()]
+        if chain not in auth_ids and chain not in asym_ids and chain not in strand_ids:
+            continue
+        seq = (data.get("entity_poly") or {}).get("pdbx_seq_one_letter_code")
+        if seq:
+            return "".join(str(seq).split()).upper()
+    return None
+
+
+def _load_deeptmhmm_3line(uniprot_id: str) -> Optional[Tuple[str, str]]:
+    """Load (uniprot_sequence, topology) from DeepTMHMM .3line file."""
+    if not _DEEPTMHMM_ENABLED or _DEEPTMHMM_DIR is None:
+        return None
+
+    uid = uniprot_id.upper()
+    with _3LINE_CACHE_LOCK:
+        if uid in _3LINE_CACHE:
+            return _3LINE_CACHE[uid]
+
+    path = _DEEPTMHMM_DIR / f"{uid}.3line"
+    if not path.is_file():
+        with _3LINE_CACHE_LOCK:
+            _3LINE_CACHE[uid] = None
+        return None
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if len(lines) < 3:
+        parsed: Optional[Tuple[str, str]] = None
+    else:
+        sequence = "".join(lines[1].split()).upper()
+        topology = lines[2].strip()
+        if len(sequence) != len(topology):
+            parsed = None
+        else:
+            parsed = (sequence, topology)
+
+    with _3LINE_CACHE_LOCK:
+        _3LINE_CACHE[uid] = parsed
+    return parsed
+
+
+def _parse_emboss_pair(path: Path) -> Tuple[Optional[str], Optional[str]]:
+    """Parse EMBOSS needle pair output into two gapped alignment strings."""
+    aligned_a: List[str] = []
+    aligned_b: List[str] = []
+    block_index = 0
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.startswith("#") or not line.strip():
+                continue
+            if line.startswith(" "):
+                continue
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            fragment = parts[2]
+            if block_index % 2 == 0:
+                aligned_a.append(fragment)
+            else:
+                aligned_b.append(fragment)
+            block_index += 1
+
+    if not aligned_a or not aligned_b:
+        return None, None
+    return "".join(aligned_a), "".join(aligned_b)
+
+
+def _run_needle_alignment(seq_a: str, seq_b: str) -> Tuple[Optional[str], Optional[str]]:
+    """Global-align seq_a (PDB chain) to seq_b (UniProt) with EMBOSS needle."""
+    if not shutil.which("needle"):
+        return None, None
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        path_a = tmp_path / "pdb_chain.fa"
+        path_b = tmp_path / "uniprot.fa"
+        path_out = tmp_path / "align.pair"
+        path_a.write_text(f">pdb_chain\n{seq_a}\n", encoding="utf-8")
+        path_b.write_text(f">uniprot\n{seq_b}\n", encoding="utf-8")
+
+        result = subprocess.run(
+            [
+                "needle",
+                "-asequence",
+                str(path_a),
+                "-bsequence",
+                str(path_b),
+                "-gapopen",
+                "10",
+                "-gapextend",
+                "0.5",
+                "-outfile",
+                str(path_out),
+                "-aformat",
+                "pair",
+                "-auto",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0 or not path_out.is_file():
+            return None, None
+        return _parse_emboss_pair(path_out)
+
+
+def _percent_intracellular_from_alignment(
+    aligned_pdb: str, aligned_uniprot: str, topology: str
+) -> Optional[float]:
+    """Fraction of doubly-aligned columns where UniProt topology is intracellular (I)."""
+    if len(aligned_pdb) != len(aligned_uniprot):
+        return None
+
+    uniprot_index = 0
+    aligned_columns = 0
+    intracellular_columns = 0
+    for pdb_char, uniprot_char in zip(aligned_pdb, aligned_uniprot):
+        if pdb_char != "-" and uniprot_char != "-":
+            aligned_columns += 1
+            if uniprot_index < len(topology) and topology[uniprot_index] == "I":
+                intracellular_columns += 1
+        if uniprot_char != "-":
+            uniprot_index += 1
+
+    if aligned_columns == 0:
+        return None
+    return intracellular_columns / aligned_columns
+
+
+def compute_percent_intracellular(
+    uniprot_id: str,
+    pdb_id: str,
+    protein_chain: Optional[str],
+    polymer_entity_ids: Sequence[str],
+) -> Optional[float]:
+    """Map PDB chain residues to DeepTMHMM topology via Needle; return fraction in 'I'."""
+    if not protein_chain:
+        return None
+
+    deeptmhmm = _load_deeptmhmm_3line(uniprot_id)
+    if deeptmhmm is None:
+        return None
+    uniprot_sequence, topology = deeptmhmm
+
+    pdb_sequence = _polymer_sequence_for_auth_chain(
+        pdb_id, protein_chain, polymer_entity_ids
+    )
+    if not pdb_sequence:
+        return None
+
+    aligned_pdb, aligned_uniprot = _run_needle_alignment(pdb_sequence, uniprot_sequence)
+    if aligned_pdb is None or aligned_uniprot is None:
+        return None
+
+    return _percent_intracellular_from_alignment(aligned_pdb, aligned_uniprot, topology)
 
 
 def _neighbor_uniprot_ids(
@@ -475,6 +660,9 @@ def get_ligands_from_pdb(
                 "smiles": _get_chemcomp_smiles(comp_id),
                 "protein_chain": protein_chain,
                 "ligand_chain": ligand_chain,
+                "percent_intracellular": compute_percent_intracellular(
+                    uniprot_id, pdb_id, protein_chain, polymer_entity_ids
+                ),
             }
         )
 
@@ -510,6 +698,7 @@ def build_rows_for_uniprot(
                     "ligand_code": None,
                     "ligand_name": None,
                     "smiles": None,
+                    "percent_intracellular": None,
                 }
             )
             continue
@@ -524,6 +713,7 @@ def build_rows_for_uniprot(
                     "ligand_code": ligand.get("ligand_code"),
                     "ligand_name": ligand.get("ligand_name"),
                     "smiles": ligand.get("smiles"),
+                    "percent_intracellular": ligand.get("percent_intracellular"),
                 }
             )
     return output_rows
@@ -580,6 +770,20 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Ignore existing cache files and refetch from network.",
     )
+    parser.add_argument(
+        "--deeptmhmm-dir",
+        type=Path,
+        default=DEFAULT_DEEPTMHMM_DIR,
+        help=(
+            "Directory with DeepTMHMM .3line files "
+            f"(default: {DEFAULT_DEEPTMHMM_DIR})."
+        ),
+    )
+    parser.add_argument(
+        "--no-deeptmhmm",
+        action="store_true",
+        help="Skip percent_intracellular computation (column will be empty).",
+    )
     return parser.parse_args()
 
 
@@ -595,6 +799,7 @@ def main() -> None:
         enabled=not args.no_cache,
         refresh=args.refresh_cache,
     )
+    _init_deeptmhmm(args.deeptmhmm_dir, enabled=not args.no_deeptmhmm)
 
     print(f"Input path: {input_path}")
     print(f"Output path: {output_path}")
@@ -606,6 +811,10 @@ def main() -> None:
         print(f"PDB cache: {args.pdb_cache_dir}")
         if args.refresh_cache:
             print("API cache: refresh (overwrite on fetch)")
+    if args.no_deeptmhmm:
+        print("DeepTMHMM: disabled")
+    else:
+        print(f"DeepTMHMM dir: {args.deeptmhmm_dir}")
 
     uniprot_ids = read_uniprot_ids(input_path)
     ligand_blacklist = read_ligand_blacklist(blacklist_path)
