@@ -3,7 +3,7 @@
 #SBATCH --partition=standard
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=112000
-#SBATCH --time=04:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=logs/uniprot_ligands-%j.out
 #SBATCH --error=logs/uniprot_ligands-%j.out
 
