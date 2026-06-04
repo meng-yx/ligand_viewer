@@ -101,8 +101,22 @@ def _optional_detail_columns(df: pd.DataFrame) -> list[str]:
     return [c for c in df.columns if c not in excluded]
 
 
+def _present_values(series: pd.Series) -> pd.Series:
+    """Non-missing values (not NaN and not empty/whitespace-only)."""
+    empty = series.isna() | series.fillna("").astype(str).str.strip().eq("")
+    return series[~empty]
+
+
+def _optional_column_is_numeric(series: pd.Series) -> bool:
+    """True when every present value is numeric; missing values are ignored."""
+    values = _present_values(series)
+    if values.empty:
+        return False
+    return bool(pd.to_numeric(values, errors="coerce").notna().all())
+
+
 def _numeric_ligand_filter_columns(df: pd.DataFrame) -> list[str]:
-    """Optional columns with at least one numeric value among ligand-coded rows."""
+    """Optional columns that are numeric on all non-missing ligand-coded rows."""
     if "ligand_code" not in df.columns:
         return []
     liganded = df[_is_liganded(df["ligand_code"])]
@@ -110,7 +124,7 @@ def _numeric_ligand_filter_columns(df: pd.DataFrame) -> list[str]:
     for col in _optional_detail_columns(df):
         if col not in liganded.columns:
             continue
-        if pd.to_numeric(liganded[col], errors="coerce").notna().any():
+        if _optional_column_is_numeric(liganded[col]):
             numeric_cols.append(col)
     return numeric_cols
 
